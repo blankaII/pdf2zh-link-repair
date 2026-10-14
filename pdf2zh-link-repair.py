@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Restore clickable PDF hyperlinks using *matched text/position features*.
+"""Restore / repair hyperlinks in PDF2ZH translated PDFs.
 
-Designed for pdf2zh_next side-by-side bilingual PDFs.  Requires PyMuPDF
-(`pip install pymupdf`).  No OCR or fixed character-count mapping.
+Requires PyMuPDF (`pip install pymupdf`), no OCR or character-count mapping.
 
 Usage:
-    python restore_dual_pdf_links_feature.py original.pdf bilingual.dual.pdf
-    python restore_dual_pdf_links_feature.py original.pdf bilingual.dual.pdf --side right
+    python pdf2zh-link-repair.py original.pdf translated.pdf
+    python pdf2zh-link-repair.py original.pdf translated.dual.pdf --mode dual
+    python pdf2zh-link-repair.py original.pdf translated.mono.pdf --mode mono
 
-Method:
-  - Match distinctive 3-word sequences (text FEATURES) between source and
-    original-language half of each bilingual page.
-  - Fit a 2-D, axis-aligned geometric transformation from their word-center
-    coordinates, then reject pages with too few consistent feature matches.
-  - Put link hitboxes back using the measured geometry, NOT by counting words.
-  - Convert source PDF named destinations from bottom-up native coordinates
-    to PyMuPDF top-down coordinates.
-  - Where the original Red Hat PDF has off-page destinations, locate the
-    target by the PDF bookmark outline and the link's heading text instead.
-    Unrecoverable numbered callouts jump to their nominal page (audited).
+AUTO mode chooses two separate methods:
 
-Only the original-language half becomes clickable.  No translated page
-content is overwritten; existing bookmarks/annotations are preserved.
+  DUAL (side-by-side, untranslated source still present): identify which
+  half contains the source text, match unique 3-word TEXT FEATURES and their
+  2-D coordinates on *each page*, fit/verify geometry and restore source
+  link hitboxes to that original-language half. Reject ambiguous layouts.
+
+  MONO (translated text, original page size): if the PDF already retains
+  the original link annotations, validate *actual* annotation targets, page
+  geometry and vector-drawing signatures, preserve the URI hotspots, and
+  normalize named internal jumps. All targets are fixed independently of
+  translation length, but translated text can reflow: emit a report of
+  clickable rectangles that no longer intersect translated text. Do not
+  invent locations for translated links that cannot be matched reliably.
+
+Shared destination fixer normalizes valid source PDF named jumps and repairs
+its malformed off-page targets by TOC/semantic features.
 """
 from __future__ import annotations
 
@@ -320,16 +323,182 @@ def restore(original_path:Path, dual_path:Path, outpath:Path, side:str):
         print(f'  audit: {audit}')
 
 
+
+def _links_match(source_link, existing_link):
+    """Annotation identity is a stronger mono feature than word count."""
+    if source_link['kind'] != existing_link['kind']:
+        return False
+    if source_link['from'] != existing_link['from']:
+        return False
+    if source_link['kind'] == fitz.LINK_URI:
+        return source_link.get('uri') == existing_link.get('uri')
+    if source_link['kind'] == fitz.LINK_NAMED:
+        return (source_link.get('nameddest') == existing_link.get('nameddest')
+                and source_link.get('page') == existing_link.get('page'))
+    if source_link['kind'] == fitz.LINK_GOTO:
+        return source_link.get('page') == existing_link.get('page')
+    return False
+
+
+def _toc_cutoff(original):
+    # Identify the first real document chapter, not by hardcoded page number.
+    toc = original.get_toc(simple=False)
+    chapters = [page - 1 for level, title, page, _ in toc
+                if level == 1 and re.match(r'^CHAPTER\s+\d+', title.replace('\xa0', ' '), re.I)]
+    return min(chapters) if chapters else 0
+
+
+def restore_mono(original_path: Path, translated_path: Path, outpath: Path):
+    """Preserve mono links already present, repair internal destinations.
+
+    Translation breaks semantic English/Chinese text matching. We therefore
+    intentionally do NOT infer hotspot positions from character counts or an
+    unchecked page-wide transform: retained annotations provide the true
+    source-link identity but not necessarily translated-label geometry.
+    """
+    if outpath.resolve() in (original_path.resolve(),translated_path.resolve()):
+        raise ValueError('Output must not overwrite an input')
+    if outpath.exists():
+        raise ValueError(f'Output already exists: {outpath}')
+    stats=Counter()
+    audit=[]
+    uncovered=[]
+    with fitz.open(original_path) as original, fitz.open(translated_path) as mono:
+        if len(original)!=len(mono):
+            raise ValueError(f'Page counts differ: {len(original)} vs {len(mono)}')
+        toc_end=_toc_cutoff(original)
+        print(f'Validating {len(original)} mono pages by existing annotation identities and drawing features ...', flush=True)
+        for pi,(src, dst) in enumerate(zip(original,mono)):
+            if src.rect != dst.rect or src.rotation != dst.rotation:
+                raise ValueError(f'Page {pi+1}: page dimensions or rotation differ; cannot assume preserved hotspots')
+            # Layout fingerprint: stable non-text graphical features.  The
+            # translation may alter text shape, but these must stay aligned.
+            src_drawings, dst_drawings=src.get_drawings(),dst.get_drawings()
+            if len(src_drawings)!=len(dst_drawings):
+                raise ValueError(f'Page {pi+1}: non-text drawing fingerprint differs ({len(src_drawings)} vs {len(dst_drawings)})')
+            stats['verified_pages']+=1
+            src_links, dst_links=src.get_links(),dst.get_links()
+            if len(src_links)!=len(dst_links):
+                raise ValueError(f'Page {pi+1}: translated PDF has {len(dst_links)} links vs source {len(src_links)}. '
+                                 'Mono content is translated, so copying link positions without matched features would be unreliable.')
+            for j,(a,b) in enumerate(zip(src_links,dst_links)):
+                if not _links_match(a,b):
+                    raise ValueError(f'Page {pi+1}: link #{j+1} differs in target/hitbox; cannot safely pair')
+            if not src_links:
+                continue
+            translated_word_boxes=[fitz.Rect(w[:4]) for w in dst.get_text('words')]
+            for j,l in enumerate(src_links):
+                if not any(l['from'].intersects(b) for b in translated_word_boxes):
+                    flag='TOC' if pi<toc_end else 'BODY'
+                    uncovered.append((pi+1,flag,j+1,str(l.get('uri',l.get('nameddest','')))))
+                    stats['no_text_toc' if pi<toc_end else 'no_text_body']+=1
+                stats['validated_links']+=1
+        # URI annotations are already correct. Rewriting named annotations
+        # IN PLACE is safer than deleting / inserting: some PDF generators
+        # share or reorder annotation array objects, and delete_link() can
+        # silently remove unrelated URI annotations on those pages.
+        for pi,src in enumerate(original):
+            dst=mono[pi]
+            src_links=src.get_links()
+            old_links=dst.get_links()
+            for source_link,old_link in zip(src_links,old_links):
+                kind=source_link['kind']
+                if kind==fitz.LINK_URI:
+                    stats['uri_preserved']+=1
+                    continue
+                if kind==fitz.LINK_NAMED:
+                    target_page,source_top=repair_named_link(original,src,source_link,stats,audit)
+                elif kind==fitz.LINK_GOTO:
+                    target_page=source_link['page']
+                    source_top=source_link.get('to',fitz.Point(0,0))
+                else:
+                    raise ValueError(f'Page {pi+1}: unsupported source link type: {kind}')
+                if (not 0<=target_page<len(mono)
+                    or not mono[target_page].rect.contains(source_top)):
+                    raise ValueError(f'Page {pi+1}: invalid repaired destination: page={target_page}, to={source_top}')
+                # PDF native destinations use bottom-up page Y, while
+                # PyMuPDF's fitz.Point uses top-down page coordinates.
+                target=mono[target_page]
+                x=source_top.x
+                pdf_y=target.rect.height-source_top.y
+                target_page_obj=mono.page_xref(target_page)
+                value=f'[{target_page_obj} 0 R /XYZ {x:.4f} {pdf_y:.4f} null]'
+                mono.xref_set_key(old_link['xref'],'Dest',value)
+                stats['internal_repaired']+=1
+        mono.save(outpath,garbage=3,deflate=True)
+        stats['source_outline']=len(original.get_toc())
+    with fitz.open(outpath) as restored:
+        stats['output_total']=sum(len(p.get_links()) for p in restored)
+        stats['output_outline']=len(restored.get_toc())
+        kind_counts=Counter(l['kind'] for p in restored for l in p.get_links())
+        stats['output_urls']=kind_counts[fitz.LINK_URI]
+        stats['output_gotos']=kind_counts[fitz.LINK_GOTO]
+        if stats['output_total']!=stats['validated_links']:
+            raise ValueError(f'Output link count mismatch: {stats["output_total"]} vs {stats["validated_links"]}')
+        if stats['output_outline']!=stats['source_outline']:
+            raise ValueError('Output outline count changed')
+        if stats['output_urls']!=stats['uri_preserved'] or stats['output_gotos']!=stats['internal_repaired']:
+            raise ValueError('Post-save URI / GOTO count mismatch')
+    report=outpath.with_suffix('.link-report.txt')
+    with report.open('w',encoding='utf-8') as f:
+        f.write('MONO PDF LINK QUALITY REPORT\n')
+        f.write('Restored destinations in an already-annotated translated PDF.\n')
+        f.write('No translated content/coordinates were changed.\n\n')
+        for key in ['verified_pages','validated_links','uri_preserved','internal_repaired',
+                    'repaired_named_destination','approximate_callout_destination',
+                    'output_total','output_urls','output_gotos','source_outline','output_outline',
+                    'no_text_toc','no_text_body']:
+            f.write(f'{key}: {stats[key]}\n')
+        f.write('\nWARNING: MONO translations can reflow text. Source link rectangles\n'
+                'are preserved rather than shifted by guessed character counts.\n'
+                'The following original hitboxes do NOT intersect any translated\n'
+                'text, even though their hyperlink actions exist and can be clicked.\n'
+                'Some intersecting hotspots may nonetheless cover the wrong text.\n'
+                'The TOC may have major translation-layout damage; this tool does not\n'
+                'rebuild its visual appearance.\n\n')
+        for pg,zone,n,target in uncovered:
+            f.write(f'page={pg}, zone={zone}, link={n}, target={target}\n')
+        f.write('\nOff-page named destination repairs:\n')
+        for pg,name,targetpage,reason in audit:
+            f.write(f'from_page={pg}, original_name={name}, repaired_page={targetpage}, reason={reason}\n')
+    print('\nMONO RESULT',flush=True)
+    for key in ['verified_pages','validated_links','uri_preserved','internal_repaired',
+                'repaired_named_destination','approximate_callout_destination',
+                'output_total','no_text_toc','no_text_body']:
+        print(f'  {key}: {stats[key]}')
+    print(f'  output: {outpath}\n  audit: {report}')
+
+
+def classify_mode(original_path: Path, translated_path: Path):
+    with fitz.open(original_path) as src, fitz.open(translated_path) as translated:
+        if not len(src) or len(src)!=len(translated):
+            raise ValueError('Source and translated PDF must have identical page counts')
+        tests=[i for i in (0, len(src)//2, len(src)-1)]
+        ratios=[translated[i].rect.width/src[i].rect.width for i in tests]
+        heights=[translated[i].rect.height/src[i].rect.height for i in tests]
+        if all(1.85 < r < 2.15 for r in ratios) and all(.94<h<1.06 for h in heights):
+            return 'dual'
+        if all(.99<r<1.01 for r in ratios) and all(.99<h<1.01 for h in heights):
+            return 'mono'
+        raise ValueError(f'Unrecognized translated layout widths={ratios}, heights={heights}')
+
+
 def main():
-    ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('original',type=Path)
-    ap.add_argument('bilingual',type=Path)
-    ap.add_argument('--side',choices=['auto','left','right'],default='auto')
+    ap=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('original',type=Path,help='PDF with intact links')
+    ap.add_argument('translated',type=Path,help='translated bilingual or monolingual PDF')
+    ap.add_argument('--mode',choices=['auto','dual','mono'],default='auto')
+    ap.add_argument('--side',choices=['auto','left','right'],default='auto',help='dual only: side of source text')
     ap.add_argument('-o','--output',type=Path)
     args=ap.parse_args()
-    out=args.output or args.bilingual.with_name(args.bilingual.stem+'.with_links.pdf')
+    out=args.output or args.translated.with_name(args.translated.stem+'.with_links.pdf')
     try:
-        restore(args.original,args.bilingual,out,args.side)
+        mode=classify_mode(args.original,args.translated) if args.mode=='auto' else args.mode
+        print(f'Selected mode: {mode}',flush=True)
+        if mode=='dual':
+            restore(args.original,args.translated,out,args.side)
+        else:
+            restore_mono(args.original,args.translated,out)
     except Exception as e:
         print(f'ERROR: {e}',file=sys.stderr)
         sys.exit(1)
