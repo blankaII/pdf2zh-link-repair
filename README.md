@@ -1,169 +1,140 @@
 # PDF2ZH Link Repair
 
-Restore and repair hyperlinks in PDF documents translated with **pdf2zh / pdf2zh_next**.
+Restore and repair hyperlinks in PDFs translated with `pdf2zh` / `pdf2zh_next`, without translating the document again.
 
-PDF translation can remove hyperlink annotations, preserve outdated clickable regions, or break internal document navigation.
-
-This project provides a lightweight Python utility that repairs hyperlinks using **text features, PDF geometry, and existing annotation metadata** — without OCR, character-count-based positioning, or retranslation.
+PDF translation may remove link annotations, preserve clickable rectangles at outdated positions, or break internal navigation. This utility uses **text features, PDF geometry, and existing link annotations**—not character counts or OCR—to make repairs where alignment can be verified.
 
 ## Features
 
-- Automatically detects bilingual (dual) and monolingual (mono) PDF layouts
-- Restores missing external hyperlinks in bilingual PDFs
-- Restores internal document navigation
-- Preserves existing hyperlinks in monolingual PDFs
-- Repairs certain invalid internal PDF destinations
-- Preserves PDF page content and bookmarks
-- Generates reports for detected link-position issues
-- Does not modify the original PDF files
+- Automatically select **dual** (side-by-side bilingual) or **mono** (translated-only) mode.
+- **Dual:** identify the original-language half and rebuild external hyperlinks and internal jumps there.
+- **Mono:** validate and retain existing hyperlinks, and repair supported internal destinations.
+- Correct certain invalid internal link destinations found in the source PDF using outline and heading features.
+- Preserve original page content, document appearance, and bookmarks.
+- Produce a repair audit or link-coverage report.
+- Refuse uncertain matches instead of guessing where links belong.
 
 ## Requirements
 
 - Python 3.10+
-- PyMuPDF
-
-Install the dependency:
+- [PyMuPDF](https://pymupdf.readthedocs.io/) (tested with 1.26.7)
 
 ```bash
-pip install pymupdf
+python -m pip install -r requirements.txt
 ```
 
-## Usage
-
-Place `restore_pdf_links.py` in your working directory.
-
-### Automatic detection (recommended)
+Alternatively:
 
 ```bash
-python restore_pdf_links.py original.pdf translated.pdf
+python -m pip install pymupdf
 ```
 
-The script automatically identifies the PDF layout and selects the appropriate repair method.
-
-### Bilingual PDF
+## Quick start
 
 ```bash
-python restore_pdf_links.py original.pdf translated.dual.pdf --mode dual
+git clone https://github.com/blankaII/pdf2zh-link-repair.git
+cd pdf2zh-link-repair
+
+python pdf2zh-link-repair.py original.pdf translated.pdf
 ```
 
-The original-language side is detected automatically.
+The utility detects the layout automatically. The default output is `translated.with_links.pdf`. It **does not overwrite input files**, and it stops if the proposed output already exists.
 
-You can also specify it manually:
+### Specify a mode
 
 ```bash
-python restore_pdf_links.py original.pdf translated.dual.pdf --mode dual --side left
+# Side-by-side bilingual PDF (automatically detect the source side)
+python pdf2zh-link-repair.py original.pdf translated.dual.pdf --mode dual
+
+# Explicitly specify which half contains the original text
+python pdf2zh-link-repair.py original.pdf translated.dual.pdf --mode dual --side left
+
+# Monolingual translated PDF
+python pdf2zh-link-repair.py original.pdf translated.mono.pdf --mode mono
+
+# Specify the output path
+python pdf2zh-link-repair.py original.pdf translated.pdf -o repaired.pdf
+
+# Show all options
+python pdf2zh-link-repair.py --help
 ```
-
-### Monolingual PDF
-
-```bash
-python restore_pdf_links.py original.pdf translated.mono.pdf --mode mono
-```
-
-### Custom output filename
-
-```bash
-python restore_pdf_links.py original.pdf translated.pdf -o repaired.pdf
-```
-
-By default, the output is:
-
-`translated.with_links.pdf`
-
-The original and translated input files are never overwritten.
 
 ## How it works
 
-### Bilingual mode
+### Dual mode: reconstruct missing links
 
-For side-by-side bilingual PDFs, the utility identifies the original-language half and matches its content against the source PDF.
+For a side-by-side bilingual page, the original text is still present. The program:
 
-The matching process uses:
+1. Extracts unique **three-word sequences** as content features.
+2. Compares their **two-dimensional coordinates** on the source and translated pages.
+3. Estimates and validates a geometric transformation for each page.
+4. Rebuilds each link's clickable rectangle on the **original-language half**.
+5. Reconstructs URL actions and internal PDF jumps.
 
-1. Unique three-word text sequences as content features
-2. Two-dimensional word coordinates
-3. Geometric transformation estimation
-4. Position consistency validation
+The translated-language half is not given new clickable rectangles.
 
-Once the original-language region is verified, the script restores hyperlink annotations and their destinations.
+If the original-language text cannot be matched reliably, the program stops rather than estimating link positions from word or character counts.
 
-**Important:** Links are restored to the original-language side only. The translated side remains unchanged.
+### Mono mode: retain existing links and fix destinations
 
-If the original text cannot be matched reliably, the process stops rather than guessing hyperlink positions.
+A monolingual translation may change word lengths, line breaks, and paragraph positions. Exact positioning cannot be inferred from the source text alone.
 
-### Monolingual mode
+The program checks **existing link identities, their rectangles, page dimensions, rotation, and non-text drawing counts** against the source. It then preserves link rectangles and external URLs, normalizes internal destinations, and reports source link rectangles that no longer intersect translated text.
 
-Monolingual translation can change word lengths, line breaks, and paragraph positions.
-
-Therefore, the bilingual matching strategy cannot be applied directly.
-
-Instead, the utility:
-
-1. Validates existing PDF hyperlink annotations
-2. Checks page geometry and structural compatibility
-3. Preserves existing hyperlink targets and clickable regions
-4. Repairs supported internal document destinations
-5. Reports clickable regions that no longer overlap translated text
-
-**Important:** This mode does not automatically relocate hyperlinks to their translated text labels. Some links may remain clickable only at their original positions.
+**Important:** Mono mode does **not** move clickable rectangles to translated words. Even rectangles that intersect text may now overlap the wrong text. If the translated PDF has removed or changed the original link annotations, this mode stops rather than guessing.
 
 ## Validation
 
-Tested using the Red Hat OpenShift Container Platform 4.21 *Installing on Google Cloud* documentation.
+Tested against a 483-page Red Hat OpenShift Container Platform 4.21 *Installing on Google Cloud* PDF and its translated outputs:
 
-| Metric | Result |
-|---|---:|
-| PDF pages | 483 |
-| Original hyperlinks | 934 |
-| External URLs | 322 |
-| Internal document links | 612 |
-| Links after repair | 934 |
-| PDF bookmarks preserved | 402 |
+| Check | Dual | Mono |
+| --- | ---: | ---: |
+| Pages | 483 | 483 |
+| External URLs | 322 / 322 | 322 / 322 |
+| Internal GoTo links | 612 / 612 | 612 / 612 |
+| Total output links | 934 / 934 | 934 / 934 |
+| PDF bookmarks | 402 | 402 |
+| Pages with unchanged content streams | 483 / 483 | 483 / 483 |
+| Identical rendered sample pages | 11 / 11 | 11 / 11 |
 
-For this test document:
+In this particular source PDF, **61** invalid named destinations were repaired using outline features and **7** numbered callout destinations could only be approximated to their declared pages. The mono output had **112** link rectangles with no translated text underneath (92 in the table of contents and 20 in the body).
 
-- All external URLs were retained or restored.
-- All internal links were converted to valid navigation targets.
-- PDF page content streams remained unchanged.
-- Sample rendered pages were pixel-identical before and after repair.
-
-The source PDF contained 68 malformed internal destinations. The utility recovered 61 using document outline features and used page-level fallback destinations for 7 numbered callouts.
-
-In the monolingual document, 112 clickable rectangles were found not to overlap translated words, primarily in the table of contents. These were reported rather than repositioned without reliable evidence.
+These are results for this test document, **not a general success-rate guarantee**.
 
 ## Limitations
 
-- Both input PDFs must have the same number of pages.
-- Bilingual mode requires a side-by-side layout containing the original text.
-- Monolingual mode requires existing compatible link annotations.
-- Internal destination recovery for malformed source PDFs may depend on document-specific bookmark structures.
-- Scanned or image-only PDFs are not supported for text-feature matching.
-- Significant page reordering, cropping, or layout restructuring may prevent reliable restoration.
-- Restored link counts do not necessarily guarantee correct clickable-text alignment.
+- Source and translated files must have the **same number of pages**.
+- Dual mode currently handles **side-by-side** pages with a recognisable original-language half. It does not handle arbitrary reflow or interleaved original/translated pages.
+- Mono mode requires the translation to retain source-compatible link annotations.
+- Mono link targets may be repaired while the visible clickable region remains inaccurate.
+- Complex rotation, nonuniform re-layout, missing source text, or image-only PDFs may be rejected.
+- Some malformed source destinations may only be recoverable approximately.
+- Restored link counts alone do not prove that every clickable region matches its intended visible label.
 
-The utility prioritizes verifiable repairs over speculative positioning.
+Check a few external links, the table of contents, and cross-chapter jumps in a PDF viewer after repair.
 
-## Generated reports
+## Reports
 
-Depending on the selected mode, the utility may generate:
+- **Dual:** `<output-stem>.link-repairs.txt` if malformed source destinations required recovery.
+- **Mono:** `<output-stem>.link-report.txt` containing validation counts and link-coverage warnings.
 
-- `.link-repairs.txt` — repaired or approximate internal destinations
-- `.link-report.txt` — monolingual hyperlink coverage and repair diagnostics
-
-Review these files when the source PDF contains malformed links or when the translation changes document layout.
-
-## Project structure
+## Repository contents
 
 ```text
 pdf2zh-link-repair/
+├── .gitignore
+├── LICENSE
 ├── README.md
-└── restore_pdf_links.py
+├── requirements.txt
+└── pdf2zh-link-repair.py
 ```
 
 ## License
 
-No license has been specified yet. Add a `LICENSE` file before distributing the project under an open-source license.
+The code in this repository is licensed under the [MIT License](LICENSE).
+
+PyMuPDF is a separate dependency with its own licensing terms; consult the [PyMuPDF licensing documentation](https://pymupdf.readthedocs.io/en/latest/about.html#license) for details.
 
 ## Disclaimer
 
-This is an independent utility intended for repairing hyperlinks in translated PDF documents. It is not an official component of pdf2zh, pdf2zh_next, or Red Hat.
+Independent utility; not an official component of pdf2zh, pdf2zh_next, or Red Hat. Do not commit private PDFs, API tokens, or credentials to a public repository.
